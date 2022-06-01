@@ -60,6 +60,7 @@ PLATFORMS
   x86_64-darwin-21
 
 DEPENDENCIES
+  nokogiri (~> 1.13)
   solargraph (~> 0.45.0)
 
 BUNDLED WITH
