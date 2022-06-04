@@ -1,8 +1,9 @@
 require "nokogiri"
+require "digest"
+require 'concurrent-ruby'
 
 class BinanceCrawler
   include Process
-  include Mutex
 
   attr_accessor :starting_root_url
 
@@ -16,6 +17,15 @@ class BinanceCrawler
     @crawl_count = crawler_count
     @crawl_queue = [@starting_root_url]
     @crawl_queue_mutex = Mutex.new
+  end
+
+  def up
+    pool = Concurrent::FixedThreadPool @crawl_count
+    pool.post do
+      crawl
+    end
+
+    pool.wait_for_termination
   end
 
   # Make a request to binance with a particular url with relevant headers
@@ -41,6 +51,27 @@ class BinanceCrawler
     IO.popen curl &:read
   end
 
+  # Make a request to download a file by its url
+  # @param url: to download
+  def download url, checksum_verify = false
+
+    checksum_url = url + ".CHECKSUM"
+
+    file_raw = open url
+
+    remote_checksum = open checksum_url if checksum_verify
+
+
+    Zip::File.open_buffer file_raw do |zip|
+      target_file = zip.first
+      puts target_file
+      if checksum_verify
+        local_checksum = Digest::SHA2.hexdigest content
+        puts "CHECKSUM does not match" unless remote_checksum.include? local_checksum
+      end
+    end
+  end
+
   # Extract child 
   # @param doc the node to parse
   # @param selector css selector
@@ -50,30 +81,58 @@ class BinanceCrawler
     selector_target[1..-1].map{|selector_node| selector_node.text}
   end
 
+
+  # Allocate threads to crawl individual urls
   def crawl
     url = nil
     @crawl_queue_mutex.synchronize do 
       url = @crawl_queue.pop
     end
-
+    pp url
     return if url.nil?
 
+    if url.end_with? ".zip" 
+      crawl_prefix url
+    else
+      crawl_key url
+    end
+  end
+  
+  # Crawl a prefix node
+  # @param url of prefix to crawl
+  def crawl_prefix url
     doc = Nokogori::HTML.parse fetch url
-
     child_prefixes = extract_children doc, "Prefix"
-
     child_keys = extract_children doc, "Key"
 
     new_prefix_urls = child_prefixes.map do |prefix|
       BASE_URL + prefix
     end
-
     @crawl_queue_mutex.synchronize do
       @crawl_queue += new_prefix_urls
     end
 
+    new_key_urls = child_keys.map do |key|
+      if key.ends_with? "CHECKSUM"
+        nil
+      else
+        BASE_URL + key
+      end
+    end.compact
 
-    child_prefixes
+    @crawl_queue_mutex.synchronize do
+      @crawl_queue += new_key_urls
+    end
+  end
 
+  # Crawl a key node
+  # @param url of key to crawl
+  def crawl_key url
+    download url, true
   end
 end
+
+
+starting_url = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?delimiter=/&prefix=data/futures/um/daily/"
+crawler = BinanceCrawler.new starting_url, 5
+crawler.up

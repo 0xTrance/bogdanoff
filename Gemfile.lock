@@ -4,6 +4,7 @@ GEM
     ast (2.4.2)
     backport (1.2.0)
     benchmark (0.2.0)
+    concurrent-ruby (1.1.10)
     diff-lcs (1.5.0)
     e2mmap (0.1.0)
     jaro_winkler (1.5.4)
@@ -60,6 +61,7 @@ PLATFORMS
   x86_64-darwin-21
 
 DEPENDENCIES
+  concurrent-ruby (~> 1.1)
   nokogiri (~> 1.13)
   solargraph (~> 0.45.0)
 
