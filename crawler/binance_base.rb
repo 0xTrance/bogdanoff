@@ -4,13 +4,19 @@ require 'concurrent-ruby'
 require "open-uri"
 require "zip"
 require "google/cloud/storage"
+require "json"
+require "logger"
+require "uri"
+require 'tempfile'
 
 Thread.abort_on_exception=true
+
+class ChecksumValidationErr < StandardError;end
 
 class BinanceCrawler
   include Process
 
-  attr_accessor :starting_root_url
+  attr_reader :starting_root_url, :bucket_client,:bucket, :crawl_count
 
   PREFIX_BASE_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?delimiter=/&prefix="
   KEY_BASE_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision/"
@@ -19,7 +25,7 @@ class BinanceCrawler
   # Initialize with root url to start the crawling process from
   # @param starting_root_url the url to start crawling from
   # @param crawler_count the number of crawlers to thread out
-  def initialize starting_root_url, crawler_count
+  def initialize starting_root_url, crawler_count, bucket_name
     @starting_root_url = starting_root_url
     @crawl_count = crawler_count
     @thread_table = {}
@@ -27,13 +33,19 @@ class BinanceCrawler
 
     @crawl_queue = [@starting_root_url]
     @crawl_queue_mutex = Mutex.new
-    
+    @bucket_client = Google::Cloud::Storage.new project_id: "arbtools-crawlers", credentials: "./arbtools-crawlers-crawler"
+    @bucket = @bucket_client.bucket bucket_name
+    @logger = Logger.new $stderr
+    @logger.level = Logger::WARN
+    Google::Apis.logger = @logger
+
+    puts "Authenticated to Bucket: #{@bucket_client}"
   end
 
   # Run crawler with the specified number of threads
   def up
     @crawl_count.times.map do |i|
-      Thread.new{crawl}
+      Thread.new {crawl}
     end.each(&:join)
   end
 
@@ -74,27 +86,42 @@ class BinanceCrawler
 
   # Make a request to download a file by its url
   # @param url: to download
-  def download url, checksum_verify = false
+  def upload_to_bucket stream, prefix
+
+    bucket_path = prefix.delete_suffix ".zip"
+    bucket_path_with_extension = bucket_path + ".csv"
+
+    @bucket.create_file stream, bucket_path_with_extension
+  end
+
+  def download file_raw_url, checksum_verify = false
     pp "Thread: #{Thread.current.object_id} \n #{@thread_table} \n #{@crawl_queue.count}"
-
     begin
-      checksum_url = url + ".CHECKSUM"
-      file_raw = URI.open url
 
+      checksum_url = file_raw_url + ".CHECKSUM"
+      file_uri = URI::parse file_raw_url
+      prefix = file_uri.path.split("/")[2..-1].join("/")
+
+      file_raw = URI.open file_uri
       if checksum_verify
         checksum_response = URI.open checksum_url
         remote_checksum = checksum_response.read.split.first
         local_checksum = Digest::SHA2.hexdigest file_raw.read
-        raise unless remote_checksum.eql? local_checksum
+        raise ChecksumValidationErr unless remote_checksum.eql? local_checksum
       end
+
+
       Zip::File.open file_raw do |zipfile|
-        #entry = zipfile.glob('*.csv').first
-        #puts entry
-        #puts entry.get_input_stream.read
+        entry = zipfile.glob('*.csv').first
         
+        #zip_extracted_io = entry.get_input_stream.read
+        extracted = StringIO.new entry.get_input_stream.read
+        upload_to_bucket extracted, prefix 
       end
-    rescue
+    rescue ChecksumValidationErr
       retry
+    rescue => e
+      raise e
     end
   end
 
@@ -187,5 +214,6 @@ end
 
 
 starting_url = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?delimiter=/&prefix=data/futures/um/daily/"
-crawler = BinanceCrawler.new starting_url, 100
+crawler = BinanceCrawler.new starting_url, 1, "bogdanoff"
+
 crawler.up
