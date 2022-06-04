@@ -8,6 +8,7 @@ require "json"
 require "logger"
 require "uri"
 require 'tempfile'
+require 'concurrent'
 
 Thread.abort_on_exception=true
 
@@ -29,9 +30,11 @@ class BinanceCrawler
     @starting_root_url = starting_root_url
     @crawl_count = crawler_count
     @thread_table = {}
+    @thread_table = Concurrent::Hash.new
     @thread_table_mutex = Mutex.new
 
-    @crawl_queue = [@starting_root_url]
+    @crawl_queue = Concurrent::Array.new
+    @crawl_queue << @starting_root_url
     @crawl_queue_mutex = Mutex.new
     @bucket_client = Google::Cloud::Storage.new project_id: "arbtools-crawlers", credentials: "./arbtools-crawlers-crawler"
     @bucket = @bucket_client.bucket bucket_name
@@ -47,18 +50,16 @@ class BinanceCrawler
     @crawl_count.times.map do |i|
       Thread.new {crawl}
     end.each(&:join)
+    puts upload
   end
 
   # Determines if the thread should terminate
   # Will terminate if there are no more jobs left AND all the threads have completed its execution
   def terminate?
+    pp "testing termination..."
     terminate = false
     @thread_table_mutex.synchronize do
-      @crawl_queue_mutex.synchronize do
-        crawl_queue_length = @crawl_queue.size
-        pp "Current crawl_queue: #{crawl_queue_length}"
-        terminate = @thread_table.values.all?{|running| not running} and @crawl_queue.empty?
-      end
+      terminate = @thread_table.values.all?{|running| not running} and @crawl_queue.empty?
     end
     terminate
   end
@@ -92,7 +93,8 @@ class BinanceCrawler
     bucket_path = prefix.delete_suffix ".zip"
     bucket_path_with_extension = bucket_path + ".csv"
 
-    puts @bucket.create_file stream, bucket_path_with_extension
+    upload = @bucket.create_file stream, bucket_path_with_extension
+    puts "Uploaded: #{bucket_path_with_extension}"
   end
 
   def download file_raw_url, checksum_verify = false
@@ -133,17 +135,13 @@ class BinanceCrawler
 
 
   def crawl_pool_up
-    @thread_table_mutex.synchronize do
-      thread_id = Thread.current.object_id
-      @thread_table[thread_id] = true
-    end
+    thread_id = Thread.current.object_id
+    @thread_table[thread_id] = true
   end
 
   def crawl_pool_down
-    @thread_table_mutex.synchronize do
-      thread_id = Thread.current.object_id
-      @thread_table[thread_id] = false
-    end
+    thread_id = Thread.current.object_id
+    @thread_table[thread_id] = false
   end
 
   # Allocate threads to crawl individual urls
@@ -152,6 +150,10 @@ class BinanceCrawler
       crawl_pool_up
       url = nil
       @crawl_queue_mutex.synchronize do 
+
+        crawl_queue_length = @crawl_queue.size
+        pp "Current crawl_queue: #{crawl_queue_length}"
+
         url = @crawl_queue.pop
       end
       if url.nil?
@@ -183,9 +185,8 @@ class BinanceCrawler
     new_prefix_urls = child_prefixes.map do |prefix|
       PREFIX_BASE_URL + prefix
     end
-    @crawl_queue_mutex.synchronize do
-      @crawl_queue += new_prefix_urls
-    end
+
+    @crawl_queue.concat new_prefix_urls
 
     new_key_urls = child_keys.map do |key|
       if key.end_with? "CHECKSUM"
@@ -195,9 +196,7 @@ class BinanceCrawler
       end
     end.compact
 
-    @crawl_queue_mutex.synchronize do
-      @crawl_queue += new_key_urls
-    end
+    @crawl_queue.concat new_key_urls
   end
   # Crawl a key node
   # @param url of key to crawl
