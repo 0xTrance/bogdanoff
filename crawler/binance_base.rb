@@ -55,6 +55,8 @@ class BinanceCrawler
     terminate = false
     @thread_table_mutex.synchronize do
       @crawl_queue_mutex.synchronize do
+        crawl_queue_length = @crawl_queue.size
+        pp "Current crawl_queue: #{crawl_queue_length}"
         terminate = @thread_table.values.all?{|running| not running} and @crawl_queue.empty?
       end
     end
@@ -66,7 +68,7 @@ class BinanceCrawler
   # @return response as plain text
   def fetch url
     curl=<<~CURL
-      curl '#{url}' \
+      curl -Ss '#{url}' \
       -H 'authority: data.binance.vision' \
       -H 'sec-ch-ua: " Not;A Brand";v="99", "Google Chrome";v="91", "Chromium";v="91"' \
       -H 'sec-ch-ua-mobile: ?0' \
@@ -87,15 +89,14 @@ class BinanceCrawler
   # Make a request to download a file by its url
   # @param url: to download
   def upload_to_bucket stream, prefix
-
     bucket_path = prefix.delete_suffix ".zip"
     bucket_path_with_extension = bucket_path + ".csv"
 
-    @bucket.create_file stream, bucket_path_with_extension
+    puts @bucket.create_file stream, bucket_path_with_extension
   end
 
   def download file_raw_url, checksum_verify = false
-    pp "Thread: #{Thread.current.object_id} \n #{@thread_table} \n #{@crawl_queue.count}"
+    #pp "Thread: #{Thread.current.object_id} \n #{@thread_table} \n #{@crawl_queue.count}"
     begin
 
       checksum_url = file_raw_url + ".CHECKSUM"
@@ -110,14 +111,10 @@ class BinanceCrawler
         raise ChecksumValidationErr unless remote_checksum.eql? local_checksum
       end
 
-
-      Zip::File.open file_raw do |zipfile|
-        entry = zipfile.glob('*.csv').first
-        
-        #zip_extracted_io = entry.get_input_stream.read
-        extracted = StringIO.new entry.get_input_stream.read
-        upload_to_bucket extracted, prefix 
-      end
+      response_zip_stream = Zip::InputStream.new file_raw
+      extract_target = response_zip_stream.get_next_entry
+      extract_io = StringIO.new extract_target.get_input_stream.read
+      upload_to_bucket extract_io, prefix
     rescue ChecksumValidationErr
       retry
     rescue => e
@@ -157,8 +154,6 @@ class BinanceCrawler
       @crawl_queue_mutex.synchronize do 
         url = @crawl_queue.pop
       end
-      pp url
-
       if url.nil?
         crawl_pool_down
 
@@ -204,7 +199,6 @@ class BinanceCrawler
       @crawl_queue += new_key_urls
     end
   end
-
   # Crawl a key node
   # @param url of key to crawl
   def crawl_key url
@@ -214,6 +208,6 @@ end
 
 
 starting_url = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?delimiter=/&prefix=data/futures/um/daily/"
-crawler = BinanceCrawler.new starting_url, 1, "bogdanoff"
+crawler = BinanceCrawler.new starting_url, 10, "bogdanoff"
 
 crawler.up
