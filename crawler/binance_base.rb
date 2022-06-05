@@ -9,6 +9,7 @@ require "logger"
 require "uri"
 require 'tempfile'
 require 'concurrent'
+require "thread"
 
 Thread.abort_on_exception=true
 
@@ -18,6 +19,7 @@ class BinanceCrawler
   include Process
 
   attr_reader :starting_root_url, :bucket_client,:bucket, :crawl_count
+  attr_accessor :crawl_queue
 
   PREFIX_BASE_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?delimiter=/&prefix="
   KEY_BASE_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision/"
@@ -33,8 +35,9 @@ class BinanceCrawler
     @thread_table = Concurrent::Hash.new
     @thread_table_mutex = Mutex.new
 
-    @crawl_queue = Concurrent::Array.new
-    @crawl_queue << @starting_root_url
+    @crawl_queue = Queue.new
+    @crawl_queue.push @starting_root_url
+
     @crawl_queue_mutex = Mutex.new
     @bucket_client = Google::Cloud::Storage.new project_id: "arbtools-crawlers", credentials: "./arbtools-crawlers-crawler"
     @bucket = @bucket_client.bucket bucket_name
@@ -50,7 +53,6 @@ class BinanceCrawler
     @crawl_count.times.map do |i|
       Thread.new {crawl}
     end.each(&:join)
-    puts upload
   end
 
   # Determines if the thread should terminate
@@ -98,7 +100,6 @@ class BinanceCrawler
   end
 
   def download file_raw_url, checksum_verify = false
-    #pp "Thread: #{Thread.current.object_id} \n #{@thread_table} \n #{@crawl_queue.count}"
     begin
 
       checksum_url = file_raw_url + ".CHECKSUM"
@@ -108,8 +109,7 @@ class BinanceCrawler
       file_raw = URI.open file_uri
       if checksum_verify
         checksum_response = URI.open checksum_url
-        remote_checksum = checksum_response.read.split.first
-        local_checksum = Digest::SHA2.hexdigest file_raw.read
+        remote_checksum = checksum_response.read.split.first local_checksum = Digest::SHA2.hexdigest file_raw.read
         raise ChecksumValidationErr unless remote_checksum.eql? local_checksum
       end
 
@@ -146,16 +146,11 @@ class BinanceCrawler
 
   # Allocate threads to crawl individual urls
   def crawl
+    puts "Starting crawl_thread: #{Thread.current.object_id}"
     loop do
       crawl_pool_up
-      url = nil
-      @crawl_queue_mutex.synchronize do 
-
-        crawl_queue_length = @crawl_queue.size
-        pp "Current crawl_queue: #{crawl_queue_length}"
-
-        url = @crawl_queue.pop
-      end
+      url = @crawl_queue.pop
+      pp "popped_url: #{url}, remaining: #{@crawl_queue.size}, for thread: #{Thread.current.object_id}"
       if url.nil?
         crawl_pool_down
 
@@ -173,6 +168,7 @@ class BinanceCrawler
       end
       crawl_pool_down
     end
+    puts "Closing crawl_thread: #{Thread.current.object_id}"
   end
   
   # Crawl a prefix node
@@ -186,8 +182,6 @@ class BinanceCrawler
       PREFIX_BASE_URL + prefix
     end
 
-    @crawl_queue.concat new_prefix_urls
-
     new_key_urls = child_keys.map do |key|
       if key.end_with? "CHECKSUM"
         nil
@@ -196,8 +190,13 @@ class BinanceCrawler
       end
     end.compact
 
-    @crawl_queue.concat new_key_urls
+    new_jobs = new_key_urls + new_prefix_urls
+    new_jobs.each do |url_job|
+      @crawl_queue.push url_job
+    end
+  
   end
+
   # Crawl a key node
   # @param url of key to crawl
   def crawl_key url
@@ -209,4 +208,7 @@ end
 starting_url = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?delimiter=/&prefix=data/futures/um/daily/"
 crawler = BinanceCrawler.new starting_url, 10, "bogdanoff"
 
+pp "FINISHED INITALIZATION"
+
 crawler.up
+crawler.crawl_queue.close
