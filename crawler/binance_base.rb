@@ -9,7 +9,6 @@ require "logger"
 require "uri"
 require 'tempfile'
 require 'concurrent'
-require "thread"
 
 Thread.abort_on_exception=true
 
@@ -24,21 +23,17 @@ class BinanceCrawler
   PREFIX_BASE_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?delimiter=/&prefix="
   KEY_BASE_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision/"
 
-
   # Initialize with root url to start the crawling process from
   # @param starting_root_url the url to start crawling from
   # @param crawler_count the number of crawlers to thread out
   def initialize starting_root_url, crawler_count, bucket_name
     @starting_root_url = starting_root_url
     @crawl_count = crawler_count
-    @thread_table = {}
-    @thread_table = Concurrent::Hash.new
-    @thread_table_mutex = Mutex.new
 
+    @thread_table = Concurrent::Hash.new
     @crawl_queue = Queue.new
     @crawl_queue.push @starting_root_url
 
-    @crawl_queue_mutex = Mutex.new
     @bucket_client = Google::Cloud::Storage.new project_id: "arbtools-crawlers", credentials: "./arbtools-crawlers-crawler"
     @bucket = @bucket_client.bucket bucket_name
     @logger = Logger.new $stderr
@@ -109,7 +104,8 @@ class BinanceCrawler
       file_raw = URI.open file_uri
       if checksum_verify
         checksum_response = URI.open checksum_url
-        remote_checksum = checksum_response.read.split.first local_checksum = Digest::SHA2.hexdigest file_raw.read
+        remote_checksum = checksum_response.read.split.first
+        local_checksum = Digest::SHA2.hexdigest file_raw.read
         raise ChecksumValidationErr unless remote_checksum.eql? local_checksum
       end
 
