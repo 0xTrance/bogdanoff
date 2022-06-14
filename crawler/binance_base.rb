@@ -79,37 +79,36 @@ class BinanceCrawler
 
   # Make a request to download a file by its url
   # @param url: to download
-  def upload_to_bucket stream, prefix
-    bucket_path = prefix.delete_suffix ".zip"
-    bucket_path_with_extension = bucket_path + ".csv"
-
-    upload = @bucket.create_file stream, bucket_path_with_extension
-    puts "Uploaded: #{bucket_path_with_extension}"
-  end
 
   def download file_raw_url, checksum_verify = false
+    checksum_url = file_raw_url + ".CHECKSUM"
+    file_uri = URI::parse file_raw_url
+    file_uri_paths = file_uri.path.split "/"
+    prefix = file_uri_paths[2 .. -1].join "/"
+    file_name = SecureRandom.uuid
+
     begin
+      # Download Zip file
+      IO.popen "curl -Ss -o ./#{file_name} '#{file_raw_url}'"
 
-      checksum_url = file_raw_url + ".CHECKSUM"
-      file_uri = URI::parse file_raw_url
-      prefix = file_uri.path.split("/")[2..-1].join("/")
-
-      file_raw = URI.open file_uri
+      # Verify checksum if necessary
       if checksum_verify
-        checksum_response = URI.open checksum_url
-        remote_checksum = checksum_response.read.split.first
-        local_checksum = Digest::SHA2.hexdigest file_raw.read
+        remote_checksum = IO.popen("curl -Ss '##{checksum_url}'", &:read).split.first
+        local_checksum = IO.popen("sha256sum ./#{file_name}", &:read).split.first
         raise ChecksumValidationErr unless remote_checksum.eql? local_checksum
       end
 
-      response_zip_stream = Zip::InputStream.new file_raw
-      extract_target = response_zip_stream.get_next_entry
-      extract_io = StringIO.new extract_target.get_input_stream.read
-      upload_to_bucket extract_io, prefix
+      bucket_path = prefix.delete_suffix ".zip"
+      bucket_path_with_extension = bucket_path + ".csv"
+
+      # unzip content and upload
+      IO.popen "unzip -p ./#{file_name} | gsutil cp - gs://#{@bucket.name}/#{bucket_path_with_extension} 2> /dev/null"
     rescue ChecksumValidationErr
       retry
     rescue => e
       raise e
+    ensure
+      IO.popen("rm -rf ./#{file_name}")
     end
   end
 
