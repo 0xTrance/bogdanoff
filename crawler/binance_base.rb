@@ -9,6 +9,9 @@ require "logger"
 require "uri"
 require 'tempfile'
 require 'concurrent'
+require "timeout"
+require "io/console"
+require_relative "./logger.rb"
 
 Thread.abort_on_exception=true
 
@@ -24,41 +27,31 @@ class BinanceCrawler
   KEY_BASE_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision/"
 
   # Initialize with root url to start the crawling process from
+  # TODO: Handle further customization
   # @param starting_root_url the url to start crawling from
   # @param crawler_count the number of crawlers to thread out
-  def initialize starting_root_url, crawler_count, bucket_name
+  def initialize starting_root_url, crawler_count, thread_fetch_timeout, bucket_name
+
     @starting_root_url = starting_root_url
     @crawl_count = crawler_count
 
-    @thread_table = Concurrent::Hash.new
+    @threads = Concurrent::Array.new
     @crawl_queue = Queue.new
     @crawl_queue.push @starting_root_url
+    @thread_fetch_timeout = thread_fetch_timeout
 
     @bucket_client = Google::Cloud::Storage.new project_id: "arbtools-crawlers", credentials: "./arbtools-crawlers-crawler"
     @bucket = @bucket_client.bucket bucket_name
-    @logger = Logger.new $stderr
-    @logger.level = Logger::WARN
-    Google::Apis.logger = @logger
-
     puts "Authenticated to Bucket: #{@bucket_client}"
+    @logger = CrawlerLogger.new
   end
 
-  # Run crawler with the specified number of threads
   def up
-    @crawl_count.times.map do |i|
+    @threads = @crawl_count.times.map do |i|
       Thread.new {crawl}
-    end.each(&:join)
-  end
-
-  # Determines if the thread should terminate
-  # Will terminate if there are no more jobs left AND all the threads have completed its execution
-  def terminate?
-    pp "testing termination..."
-    terminate = false
-    @thread_table_mutex.synchronize do
-      terminate = @thread_table.values.all?{|running| not running} and @crawl_queue.empty?
     end
-    terminate
+    @threads.map(&:join)
+    @crawl_queue.close
   end
 
   # Make a request to binance with a particular url with relevant headers
@@ -129,42 +122,49 @@ class BinanceCrawler
     selector_target.map{|selector_node| selector_node.text}
   end
 
-
-  def crawl_pool_up
-    thread_id = Thread.current.object_id
-    @thread_table[thread_id] = true
+  def finished?
+    all_idle_threads? and ! @crawl_queue.closed? and !actions?
   end
 
-  def crawl_pool_down
-    thread_id = Thread.current.object_id
-    @thread_table[thread_id] = false
+  def all_idle_threads?
+    #pp @threads
+    not @threads.empty? and @threads.all? do |thread|
+      thread.status.eql? "sleep"
+    end
+  end
+
+  def actions?
+    not @crawl_queue.empty?
+  end
+
+  # Pop off a new task if it exists, else, make the thread sleep
+  def pop_task wait = true
+    begin
+      Timeout.timeout  @thread_fetch_timeout do
+        @crawl_queue.pop !wait
+      end
+    rescue Timeout::Error
+      return nil
+    end
   end
 
   # Allocate threads to crawl individual urls
   def crawl
-    puts "Starting crawl_thread: #{Thread.current.object_id}"
-    loop do
-      crawl_pool_up
-      url = @crawl_queue.pop
-      pp "popped_url: #{url}, remaining: #{@crawl_queue.size}, for thread: #{Thread.current.object_id}"
-      if url.nil?
-        crawl_pool_down
+    while not finished?
+      url = pop_task
 
-        if terminate?
-          return
-        else
-          next
-        end
-      end
+      @logger.log "status: \"#{Thread.current.status}\" crawling: \"#{url}\"", @crawl_queue
 
-      if url.end_with? ".zip" 
+      next if url.nil?
+
+      if url.end_with? ".zip"
         crawl_key url
       else
         crawl_prefix url
       end
-      crawl_pool_down
     end
-    puts "Closing crawl_thread: #{Thread.current.object_id}"
+    
+    pp "FINISHED EXECUTION for thread: #{Thread.current.object_id}"
   end
   
   # Crawl a prefix node
@@ -202,9 +202,8 @@ end
 
 
 starting_url = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?delimiter=/&prefix=data/futures/um/daily/"
-crawler = BinanceCrawler.new starting_url, 10, "bogdanoff"
+crawler = BinanceCrawler.new starting_url, 100, 10, "bogdanoff"
 
 pp "FINISHED INITALIZATION"
 
 crawler.up
-crawler.crawl_queue.close
